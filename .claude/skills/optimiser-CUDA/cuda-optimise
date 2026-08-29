@@ -1,0 +1,497 @@
+---
+name: cuda-optimize
+description: Optimize CUDA C/C++ GPU workloads for measured performance on a specified NVIDIA GPU. Use for CUDA kernels, CUDA extensions, custom GPU operators, PyTorch CUDA extensions, and benchmark-driven kernel optimization when the implementation must remain pure CUDA rather than Triton. Use Nsight Compute (ncu), Nsight Systems (nsys), nvidia-smi, CUDA events, and benchmark results to drive correctness-first, hypothesis-driven optimization; preserve numerical contracts, precision boundaries, and benchmark gates; log experiments and discoveries for later reporting.
+---
+
+# CUDA Optimize
+
+## Core objective
+
+Optimize the supplied CUDA implementation for the actual benchmark and target NVIDIA GPU.
+
+The goal is not to maximize custom CUDA code. The goal is to produce the fastest implementation that:
+
+1. passes the benchmark's correctness gate,
+2. improves the measured latency or throughput,
+3. preserves the required API and tensor semantics,
+4. uses pure CUDA/C++ for custom GPU work.
+
+Do not use Triton. Do not replace a strong CUDA library primitive with a handwritten kernel without evidence that the replacement can win.
+
+## Required workflow
+
+Follow this sequence for every optimization effort.
+
+### 1. Establish the baseline
+
+Inspect the benchmark, reference implementation, candidate implementation, build system, and runtime environment before editing code.
+
+Record:
+
+- GPU model and compute capability
+- driver/runtime and CUDA toolkit version
+- compiler and optimization flags
+- framework and library versions
+- input shapes
+- dtype and precision settings
+- correctness tolerance
+- warmup policy
+- timing method
+- baseline latency/throughput
+- relevant kernel launch count if available
+
+Run the benchmark before making changes when the environment permits.
+
+### 2. Map the computation
+
+Trace the workload from input to output and identify:
+
+- GEMMs
+- reductions
+- elementwise work
+- memory copies
+- transposes/layout conversions
+- synchronization points
+- kernel launches
+- temporary tensors
+- host/device synchronization
+
+Classify each stage as primarily compute-bound, memory-bound, latency/launch-bound, synchronization-bound, or bandwidth/traffic dominated.
+
+Do not assume the bottleneck from source code alone.
+
+### 3. Protect correctness first
+
+Define the exact numerical contract before optimizing.
+
+Record:
+
+- allowed absolute error
+- allowed relative error
+- non-finite requirements
+- dtype of inputs and outputs
+- required masking behavior
+- accumulation precision
+- explicit cast points
+- deterministic requirements
+
+Preserve all benchmark-specified precision boundaries unless an experiment is explicitly testing a boundary change.
+
+Never weaken tolerances merely to make a CUDA kernel pass.
+
+### 4. Form one hypothesis
+
+Before each code change, state:
+
+- bottleneck
+- hypothesis
+- expected mechanism
+- expected metric improvement
+- possible correctness or resource tradeoff
+
+Examples:
+
+- "The kernel is register-limited; reducing per-thread live state should increase occupancy."
+- "Repeated global-memory reads dominate; shared-memory staging should reduce DRAM traffic."
+- "Launch overhead dominates this small shape; fusing two elementwise stages should reduce runtime."
+- "The GEMM is already handled by cuBLAS; replacing it is unlikely to win without evidence."
+
+Make the smallest change that tests the hypothesis.
+
+### 5. Measure correctness
+
+Run correctness before performance unless the test itself requires a performance-only diagnostic.
+
+If correctness fails, isolate the earliest divergence.
+
+Compare intermediate tensors or kernel outputs in this order where relevant:
+
+1. inputs
+2. transformed/layout-converted inputs
+3. kernel inputs
+4. intermediate reductions
+5. final kernel output
+6. downstream operator output
+7. full-model output
+
+Separate:
+
+- algorithmic errors
+- masking/indexing errors
+- race conditions
+- uninitialized memory
+- accumulation-order differences
+- dtype/cast differences
+- library implementation differences
+
+### 6. Profile the GPU
+
+Use `nvidia-smi` for hardware/runtime checks.
+
+Use Nsight Systems (`nsys`) to answer:
+
+- How many kernels launch?
+- Which kernels dominate wall-clock time?
+- Is there host-side launch overhead?
+- Are there synchronization gaps?
+- Are kernels serialized unexpectedly?
+
+Use Nsight Compute (`ncu`) for kernel-level questions:
+
+- achieved occupancy
+- registers per thread
+- shared-memory usage
+- local-memory spills
+- DRAM throughput
+- L2/cache behavior
+- SM utilization
+- instruction mix
+- Tensor Core utilization where applicable
+- memory transaction efficiency
+- stall reasons
+- warp execution efficiency
+
+Do not collect the largest metric set by default. Start focused, then expand when the evidence demands it.
+
+### 7. Optimize only the measured bottleneck
+
+Use CUDA-specific levers appropriate to the bottleneck.
+
+#### Launch/latency bound
+
+Consider:
+
+- kernel fusion
+- fewer launches
+- larger useful work per launch
+- reducing host/device synchronization
+- eliminating unnecessary intermediate tensors
+- CUDA Graphs when the workload is static and graph capture is valid
+
+#### Memory bound
+
+Consider:
+
+- coalesced global loads/stores
+- contiguous layouts
+- vectorized loads/stores when alignment permits
+- shared-memory tiling
+- reducing global-memory passes
+- avoiding redundant reads/writes
+- reducing temporary tensors
+- cache-friendly access order
+
+Check shared-memory bank conflicts after introducing shared-memory tiling.
+
+#### Compute bound
+
+Consider:
+
+- instruction reduction
+- better tiling
+- warp/block sizing
+- Tensor Core paths when mathematically and numerically appropriate
+- FMA-friendly formulation
+- reducing unnecessary type conversions
+- using cuBLAS/cuBLASLt for standard GEMMs before considering custom GEMM
+
+#### Register bound
+
+Consider:
+
+- reducing live state
+- smaller tiles
+- fewer temporaries
+- simpler control flow
+- moving reusable data to shared memory when justified
+
+Do not chase occupancy for its own sake. Higher occupancy is useful only when it improves the limiting resource.
+
+#### Synchronization bound
+
+Consider:
+
+- reducing `__syncthreads()` usage
+- restructuring cooperative work
+- using warp-level primitives when safe
+- replacing unnecessary block-wide coordination with warp-local operations
+
+Preserve synchronization correctness before measuring performance.
+
+## CUDA implementation rules
+
+### Grid/block configuration
+
+Choose block dimensions from measured behavior.
+
+Test a small controlled set of configurations rather than exhaustive blind search.
+
+Record:
+
+- threads/block
+- blocks/grid
+- shared memory/block
+- registers/thread
+- occupancy
+
+### Memory
+
+Prefer coalesced access patterns.
+
+Use shared memory when it reduces repeated global-memory traffic enough to offset synchronization and occupancy costs.
+
+Use read-only/cache-friendly paths where appropriate and supported.
+
+Do not add shared memory simply because it is available.
+
+### Warp primitives
+
+Use warp shuffle/reduction primitives for reductions that fit the warp-level model.
+
+Verify lane masks and synchronization assumptions carefully.
+
+### Atomics
+
+Treat atomics as a measured tradeoff.
+
+Check contention and serialization before replacing them.
+
+### Asynchronous copy
+
+On supported GPUs, consider `cp.async` or other architecture-appropriate asynchronous global-to-shared movement only when profiling indicates memory movement is limiting.
+
+Guard architecture-specific code with clear capability checks.
+
+### CUDA streams
+
+Preserve the benchmark's stream semantics.
+
+Do not add synchronization that is unnecessary for correctness.
+
+Do not remove synchronization that the benchmark or caller depends on.
+
+### Library primitives
+
+Prefer proven NVIDIA libraries for standard operations when they are already highly optimized:
+
+- cuBLAS
+- cuBLASLt
+- cuDNN where applicable
+- other NVIDIA CUDA libraries appropriate to the operation
+
+A handwritten kernel must demonstrate an actual advantage before replacing a library primitive.
+
+## Precision and numerical fidelity
+
+Treat precision as an explicit design dimension.
+
+For every important operator record:
+
+```text
+storage dtype
+input dtype to arithmetic
+accumulator dtype
+output dtype
+explicit cast location
+
+Do not conflate:
+
+storage precision
+multiplication precision
+accumulation precision
+reduction order
+final rounding
+
+Two FP32 calculations can differ because their reduction order differs.
+
+Two FP16 calculations can differ because of different instruction paths, accumulation behavior, or intermediate casts.
+
+When matching an existing benchmark, reproduce its observable precision boundaries first. Only move a boundary as a controlled experiment.
+
+For reductions:
+
+keep critical statistics in the intended accumulator dtype,
+avoid repeated narrowing casts,
+document deterministic versus non-deterministic reduction order,
+measure both correctness and performance after any reduction rewrite.
+Determinism
+
+Do not claim a kernel is deterministic merely because it uses one accumulator variable.
+
+Determinism depends on the actual execution and reduction order, race freedom, atomics, scheduling, and library implementation.
+
+When deterministic output is required:
+
+identify all parallel reductions,
+eliminate data races,
+use a fixed reduction structure where practical,
+control algorithm/library choices when supported,
+run repeated identical trials and compare outputs.
+Benchmark methodology
+
+Use the benchmark's own timing method whenever possible.
+
+For CUDA timing, prefer CUDA events around the target region when the benchmark specifies event timing.
+
+Warm up kernels before measurement.
+
+Synchronize only where required for correct timing.
+
+Report:
+
+median latency
+mean latency
+p90 latency
+minimum latency
+throughput if meaningful
+speedup versus baseline
+correctness result
+
+For multiple benchmark shapes, report results per shape. Never hide regressions behind an aggregate average.
+
+Shape specialization
+
+If the benchmark contains a fixed set of official shapes, optimize for those exact workloads.
+
+Shape-specific specialization may use:
+
+different launch configurations
+different tile sizes
+different kernel variants
+different fusion choices
+different library algorithms
+
+Do not assume a single kernel configuration is optimal across all shapes.
+
+However, preserve a safe general path when inputs outside the official set must remain supported.
+
+Long-sequence workloads
+
+For attention-like workloads with extremely long sequence lengths, never materialize an infeasible quadratic intermediate merely because the reference implementation does so.
+
+Use a streaming or tiled CUDA algorithm when the benchmark requires such a case.
+
+Only deviate from the reference algorithm when correctness can be demonstrated under the benchmark's actual acceptance criteria.
+
+Experiment logging
+
+Maintain experiments.md when the project asks for a discovery or optimization history.
+
+Every experiment should contain:
+
+ID/title
+date
+benchmark configuration
+baseline version/commit if available
+hypothesis
+exact code/configuration change
+expected outcome
+correctness result
+performance result
+profiler evidence
+interpretation
+decision: KEEP / REVERT / PARTIAL / INVESTIGATE
+next experiment
+
+Record failures. Do not rewrite history after the fact.
+
+Distinguish observed facts from hypotheses.
+
+Example:
+
+## Experiment 007 - Reduce register pressure
+
+### Hypothesis
+The kernel is limited by register usage at 128 registers/thread.
+
+### Change
+Reduced tile width from 128 to 96 and removed one live temporary.
+
+### Result
+Registers: 128 -> 96
+Occupancy: 37.5% -> 50%
+Median latency: 0.84 ms -> 0.71 ms
+Correctness: PASS
+
+### Discovery
+The kernel was register-limited, and the smaller tile improved latency without
+increasing DRAM traffic enough to offset the gain.
+
+### Decision
+KEEP
+Multi-agent workflow
+
+When multiple agents are available, separate responsibilities:
+
+CUDA kernel optimizer
+
+Own code changes to CUDA kernels and launch configuration.
+
+correctness analyst
+
+Own numerical diagnostics, precision-boundary analysis, and regression testing.
+
+GPU profiler
+
+Own Nsight Systems/Compute runs and bottleneck identification.
+
+benchmark analyst
+
+Own cross-shape comparisons and decide which candidate wins per workload.
+
+experimentation historian
+
+Own experiments.md, discoveries, rejected approaches, and report-ready chronology.
+
+Do not have multiple agents edit the same CUDA source simultaneously unless the task is explicitly coordinated.
+
+Prefer separate git branches/worktrees for competing implementations.
+
+Preferred command patterns
+Hardware check
+nvidia-smi
+CUDA compiler
+nvcc --version
+Systems profiling
+nsys profile -o profiles/run01 --stats=true <benchmark-command>
+Kernel profiling
+ncu -o profiles/kernel01 --set basic <benchmark-command>
+
+Use kernel filters, launch skipping, and launch counting when available so profiling targets the intended kernel rather than the entire application.
+
+For automated analysis, use machine-readable output where practical.
+
+Build discipline
+
+Use the project's existing build system where available.
+
+Preserve compiler flags unless the experiment explicitly tests them.
+
+When changing compiler flags, record the old and new flags and treat the flag change as its own experiment if it can affect causality.
+
+Review checklist before keeping an optimization
+
+Confirm all of the following:
+
+correctness gate passes,
+output shapes and semantics match,
+no new race or undefined behavior,
+no unexpected synchronization was introduced,
+no unacceptable register/shared-memory increase,
+measured latency improved on the intended shape(s),
+regressions on other official shapes are understood,
+precision boundaries are documented,
+experiment is recorded,
+code comments explain non-obvious CUDA behavior.
+Final response format
+
+When completing an optimization experiment, report:
+
+What changed
+Why it should help
+Correctness result
+Performance result
+Profiler evidence
+Tradeoffs/regressions
+Decision
+Next experiment

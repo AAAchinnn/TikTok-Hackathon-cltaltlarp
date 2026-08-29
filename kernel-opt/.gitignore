@@ -1,0 +1,4 @@
+harness/__pycache__/
+tools/__pycache__/
+kernels/_build/
+*.ncu-rep
