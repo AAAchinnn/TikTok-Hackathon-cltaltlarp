@@ -234,6 +234,7 @@ def _build_plan(key: Key) -> Plan:
     if spec is None:
         return _default_plan(key)
 
+    default = _default_plan(key)
     chosen: Dict[str, Callable] = {}
     for slot, name in spec.items():
         if slot not in SLOTS:
@@ -242,8 +243,17 @@ def _build_plan(key: Key) -> Plan:
         if fn is None:
             # Table names a candidate that no longer exists (renamed, deleted,
             # or its module was not imported). Degrade rather than crash.
-            return replace(_default_plan(key), source=f"missing:{slot}/{name}")
+            return replace(default, source=f"missing:{slot}/{name}")
         chosen[slot] = fn
+
+    # A table entry may name only the slots it has an opinion about. The rest
+    # take the general candidate rather than becoming None, so `names()`
+    # reports what actually runs instead of leaving a hole the caller has to
+    # interpret.
+    if chosen.get("full_block") is None:
+        for slot in ("attn_block", "ffn_block"):
+            if chosen.get(slot) is None:
+                chosen[slot] = getattr(default, slot)
 
     return Plan(**chosen, source="table")
 
@@ -251,9 +261,11 @@ def _build_plan(key: Key) -> Plan:
 def _default_plan(key: Key) -> Plan:
     """Safe path for any shape the autotuner has not measured.
 
-    Prefers candidates registered as "general" - correct everywhere, tuned for
-    nothing. If none are registered, every slot is None and the encoder runs the
-    unmodified baseline.
+    Takes the candidates registered as "general" - correct everywhere, tuned
+    for nothing. They live in opt/blocks.py and are registered on import of the
+    `opt` package, so this is the path every shape follows until a routing
+    table says otherwise. If none are registered, every slot is None and the
+    encoder falls back to its own built-in path.
     """
     return Plan(
         attn_block=_REGISTRY["attn_block"].get("general"),
