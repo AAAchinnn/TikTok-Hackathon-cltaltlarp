@@ -1,0 +1,5 @@
+# Keep line endings consistent. opt/*.py drifted to CRLF early on, which made
+# every diff look like a whole-file rewrite. Normalise on checkin.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

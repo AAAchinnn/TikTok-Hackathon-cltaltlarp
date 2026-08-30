@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from opt import OptimizedMixin
+
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -172,7 +174,7 @@ class BaselineTransformer(nn.Module):
         return x
 
 
-class UserOptimizedTransformer(BaselineTransformer):
+class UserOptimizedTransformer(OptimizedMixin, BaselineTransformer):
     """
     Replace this class with the optimized implementation.
 
