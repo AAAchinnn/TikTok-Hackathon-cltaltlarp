@@ -19,7 +19,6 @@ Layout:
     precision.py   which GEMMs get narrowed, decided by measurement
     masking.py     all-valid elision and suffix-padding verification
     dispatcher.py  shape -> candidate routing
-    triton_attn.py hand-written Triton attention, parked
 
 Every forward goes through the dispatcher. With no routing table present for
 the current GPU it returns the "general" candidates, which are the permanent

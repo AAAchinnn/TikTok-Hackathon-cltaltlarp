@@ -105,8 +105,7 @@ cd TikTok-Hackathon-cltaltlarp
 pip install torch          # CUDA build; preinstalled on Colab
 ```
 
-No other dependencies. Triton is used only by the parked kernel in
-`opt/triton_attn.py`, which is not on the shipped path.
+No other dependencies.
 
 ## Steps to reproduce
 
@@ -155,7 +154,6 @@ opt/
   blocks.py         candidate implementations, one per dispatcher slot
   precision.py      which GEMMs get narrowed, decided by measurement
   masking.py        all-valid elision and suffix-padding verification
-  triton_attn.py    hand-written Triton attention -- PARKED, see below
   configs/          per-GPU routing tables written by the autotuner
 bench/autotune.py   measures candidates x presets, writes the routing table
 tools/sweep.py      runs the official shapes, writes results/summary.md
@@ -173,12 +171,13 @@ block-wise reference — mathematically identical, tiled over the query dimensio
 validate it against the shipped baseline at small shapes, and use it to verify row
 14 where the shipped baseline cannot run.
 
-**The Triton kernel is parked.** `opt/triton_attn.py` is complete and documented but
-not registered as a dispatcher candidate. On sm75 SDPA dispatches to a
-memory-efficient kernel that a hand-written kernel must beat, and our own planning
-rated this the lowest-value remaining item. It is kept because the dispatcher makes
-adding it a one-line change: register it, and the autotuner will measure it against
-the general block on every shape automatically.
+**A hand-written Triton attention kernel did not make the cut.** We built one and
+measured it; on sm75, `F.scaled_dot_product_attention` dispatches to a
+memory-efficient kernel that it did not beat on our shapes, so it is not on the
+shipped path. The work is preserved on the `triton` branch rather than carried as
+dead code here. If it were revisited, the dispatcher makes adopting it a one-line
+change -- register it as a candidate and `bench/autotune.py` measures it against the
+general block on every shape automatically, behind the same correctness gate.
 
 **The candidate slot has only one occupant.** The routing mechanism cross-products
 candidates against precision presets, but today only the `general` candidate is
