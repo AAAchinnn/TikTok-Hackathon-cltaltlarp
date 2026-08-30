@@ -111,6 +111,7 @@ class OptimizedMixin:
         self._backend_flags_set = False
         self._announced = False
         self._routed = False
+        self._cuda_graphs: Dict[Tuple, dict] = {}  # Route 3: keyed by shape+dtype+plan
 
         if settings.use_compile:
             # The benchmark has 14 official shapes against a Dynamo cache
@@ -235,6 +236,12 @@ class OptimizedMixin:
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        B = x.shape[0]
+        if B >= 128:
+            return self._forward_compute_heavy(x, valid_token_mask)
+        if B <= 4:
+            return self._forward_low_overhead(x, valid_token_mask)
+
         config = self.config  # type: ignore[attr-defined]
 
         # Mask analysis and weight packing stay outside the compiled region:
@@ -243,7 +250,14 @@ class OptimizedMixin:
         mask = masking.effective_mask(valid_token_mask)
         invalid = None if mask is None else ~mask[..., None]
 
-        plan = self._plan_for(x, mask, config.causal)
+        # Which implementation runs in each slot, and -- if the shape has been
+        # autotuned -- which precision plan. Resolved from shapes and dtypes
+        # only (no tensor contents, so no synchronisation) and cached inside
+        # the dispatcher, so the steady-state cost is one dict lookup.
+        # Resolution happens here rather than inside _run so the chosen
+        # callables are constants by the time Dynamo traces the loop.
+        route = dispatcher.resolve(x, config)
+        plan = self._plan_for(x, mask, config.causal, route)
 
         if not self._backend_flags_set:
             apply_backend_flags(plan.compute_dtype, x.dtype)
@@ -259,12 +273,6 @@ class OptimizedMixin:
         weights = self._weights(plan, x.dtype)
         ctx = self._context(x, plan, attn_mask, is_causal)
 
-        # Which implementation runs in each slot. Resolved from shapes and
-        # dtypes only -- no tensor contents, so no synchronisation -- and
-        # cached inside the dispatcher, so the steady-state cost is one dict
-        # lookup. Resolution happens here rather than inside _run so the chosen
-        # callables are constants by the time Dynamo traces the loop.
-        route = dispatcher.resolve(x, config)
         if settings.verbose and not self._routed:
             print(f"[opt] route: {route.source} | {route.names()}")
             self._routed = True
@@ -290,8 +298,116 @@ class OptimizedMixin:
 
         return self._run(x, invalid, weights, ctx, attn_fn, ffn_fn, full_fn)
 
+    # -- Route 2: fp16 Tensor Cores for GEMM-dominated large batches ----------
+    # B >= 128 means B*N >= 16k tokens.  T4 fp16 Tensor Cores run at
+    # 65 TFLOPS vs 8 TFLOPS fp32 (no TF32 on sm75), so all-fp16 is the main
+    # lever.  We skip the calibrator here: for d=128 shapes fp16/all sits at
+    # max_abs ~1e-3 (well inside atol=0.002) and the calibration measurement
+    # costs ~20 forward passes -- for batch10k that is ~30 unmetered seconds.
+
+    def _forward_compute_heavy(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        config  = self.config  # type: ignore[attr-defined]
+        mask    = masking.effective_mask(valid_token_mask)
+        invalid = None if mask is None else ~mask[..., None]
+
+        route = dispatcher.resolve(x, config)
+        if route.precision is not None:
+            plan = route.precision
+        elif not settings.calibrate:
+            plan = Plan(
+                settings.compute_dtype,
+                settings.narrow_preset or "all",
+                reason="pinned",
+            )
+        else:
+            # The one path not gated by a measurement. fp16/all is the informed
+            # default -- see the note above -- but it is a default, not
+            # evidence. Autotune the shape and the branch above takes over.
+            plan = Plan(torch.float16, "all", reason="compute_heavy")
+
+        if not self._backend_flags_set:
+            apply_backend_flags(plan.compute_dtype, x.dtype)
+            self._backend_flags_set = True
+
+        attn_dtype           = plan.dtype_for("attn", x.dtype)
+        attn_mask, is_causal = masking.build_attn_mask(
+            x.shape[1], mask, config.causal, attn_dtype, x.device
+        )
+        weights  = self._weights(plan, x.dtype)
+        ctx      = self._context(x, plan, attn_mask, is_causal)
+        attn_fn  = route.attn_block or blocks.attn_general
+        ffn_fn   = route.ffn_block  or blocks.ffn_general
+        full_fn  = route.full_block
+
+        # Reuse the shared compiled _run -- Dynamo produces a separate
+        # specialisation for fp16 weights automatically.
+        if settings.use_compile and self._compiled is not False:
+            if self._compiled is None:
+                self._compiled = torch.compile(
+                    self._run, dynamic=False, mode=settings.compile_mode
+                )
+            try:
+                return self._compiled(x, invalid, weights, ctx, attn_fn, ffn_fn, full_fn)
+            except Exception as exc:
+                print(f"[opt/route2] compile fell back: {type(exc).__name__}: {exc}")
+                self._compiled = False
+
+        return self._run(x, invalid, weights, ctx, attn_fn, ffn_fn, full_fn)
+
+    # -- Route 3: CUDA graph replay for kernel-launch-dominated tiny batches --
+    # B <= 4: ~40 kernel launches at 5-10 µs each = 200-400 µs overhead out of
+    # a ~2 ms forward pass.  A CUDAGraph collapses the entire pass to one host
+    # command (~1 µs).  We capture the uncompiled _run -- running compile inside
+    # a graph recording can trigger Triton recompilation and break the capture.
+
+    def _forward_low_overhead(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        config  = self.config  # type: ignore[attr-defined]
+        mask    = masking.effective_mask(valid_token_mask)
+        invalid = None if mask is None else ~mask[..., None]
+
+        route = dispatcher.resolve(x, config)
+        plan = self._plan_for(x, mask, config.causal, route)
+        if not self._backend_flags_set:
+            apply_backend_flags(plan.compute_dtype, x.dtype)
+            self._backend_flags_set = True
+
+        attn_dtype           = plan.dtype_for("attn", x.dtype)
+        attn_mask, is_causal = masking.build_attn_mask(
+            x.shape[1], mask, config.causal, attn_dtype, x.device
+        )
+        weights  = self._weights(plan, x.dtype)
+        ctx      = self._context(x, plan, attn_mask, is_causal)
+        attn_fn  = route.attn_block or blocks.attn_general
+        ffn_fn   = route.ffn_block  or blocks.ffn_general
+        full_fn  = route.full_block
+
+        gkey = (tuple(x.shape), x.dtype, invalid is not None, str(plan))
+        if gkey not in self._cuda_graphs:
+            self._cuda_graphs[gkey] = _capture_graph(
+                self._run, x, invalid, weights, ctx, attn_fn, ffn_fn, full_fn
+            )
+
+        gd = self._cuda_graphs[gkey]
+        gd["x"].copy_(x)
+        if invalid is not None and gd["inv"] is not None:
+            gd["inv"].copy_(invalid)
+        gd["graph"].replay()
+        return gd["out"].clone()
+
     def _plan_for(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor], causal: bool
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        causal: bool,
+        route: Optional["dispatcher.Plan"] = None,
     ) -> Plan:
         """Choose the precision plan for this shape, measuring on first sight.
 
@@ -300,6 +416,13 @@ class OptimizedMixin:
         harness runs for 20 untimed iterations before any timing, so it costs
         nothing that is measured.
         """
+        # A measured table entry outranks calibration. bench/autotune.py gated
+        # it against the baseline at the real tolerance over several inputs;
+        # calibration gets one warmup forward against our own fp32 output and
+        # has to keep a margin in hand for the difference.
+        if route is not None and route.precision is not None:
+            return route.precision
+
         if not settings.calibrate:
             return Plan(
                 settings.compute_dtype,
@@ -380,3 +503,38 @@ class OptimizedMixin:
         if invalid is not None:
             x = x.masked_fill(invalid, 0)
         return x
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph helper (module-level so it is not part of the compiled region)
+# ---------------------------------------------------------------------------
+
+def _capture_graph(run_fn, x, invalid, weights, ctx, attn_fn, ffn_fn, full_fn):
+    """Warmup then capture run_fn into a CUDAGraph.
+
+    Static tensors (fixed device addresses) hold clones of the first inputs.
+    On replay the caller copies live data in, replays, then clones the output
+    so the caller cannot alias the static buffer.
+
+    The warmup runs on a side stream so that cuBLAS / cuDNN algorithm
+    selection (which allocates memory) is finished before capture starts.
+    CUDAGraph capture requires a memory-allocation-free execution path.
+    """
+    static_x   = x.clone()
+    static_inv = invalid.clone() if invalid is not None else None
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            with torch.inference_mode():
+                run_fn(static_x, static_inv, weights, ctx, attn_fn, ffn_fn, full_fn)
+    torch.cuda.current_stream().wait_stream(side)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.inference_mode(), torch.cuda.graph(g, stream=side):
+        static_out = run_fn(
+            static_x, static_inv, weights, ctx, attn_fn, ffn_fn, full_fn
+        )
+
+    return {"graph": g, "x": static_x, "inv": static_inv, "out": static_out}

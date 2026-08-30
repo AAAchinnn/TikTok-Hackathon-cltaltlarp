@@ -31,8 +31,10 @@ Importing this package registers the general candidates as a side effect, via
 `blocks`. That import is load-bearing: without it the registry is empty and
 `dispatcher._default_plan` has nothing to return.
 
-Run `python tools/diagnose.py` for per-stage error tables and
-`python tools/sweep.py` for the shape x preset matrix.
+`python tools/sweep.py` runs the official shapes through the harness and
+writes results_sweep/summary.md. `python bench/autotune.py` measures every
+candidate x precision combination behind the accuracy gate and writes the
+routing table this package reads.
 """
 
 from . import blocks  # noqa: F401  -- registers the "general" candidates

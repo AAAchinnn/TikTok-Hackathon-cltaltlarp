@@ -31,6 +31,8 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
+from .precision import NARROW_PRESETS, Plan as PrecisionPlan
+
 
 # --------------------------------------------------------------------------
 # Slots
@@ -133,6 +135,12 @@ class Plan:
     attn_block: Optional[Callable] = None
     ffn_block: Optional[Callable] = None
     full_block: Optional[Callable] = None
+    # The precision plan the autotuner measured for this shape. `None` means
+    # nothing was measured, and general.py falls back to calibrating at run
+    # time. A table entry is strictly better evidence: it was gated against the
+    # baseline at the real tolerance over several inputs, where calibration
+    # gets one warmup forward and a safety margin.
+    precision: Optional[PrecisionPlan] = None
     source: str = "fallback"
 
     def names(self) -> Dict[str, str]:
@@ -155,7 +163,7 @@ FALLBACK_PLAN = Plan(source="fallback")
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
 
-_TABLE: Optional[Dict[Key, Dict[str, str]]] = None
+_TABLE: Optional[Dict[Key, dict]] = None
 _TABLE_SOURCE: str = "none"
 
 
@@ -177,12 +185,12 @@ def load_table(path: Optional[Path] = None) -> int:
     if path is None:
         path = CONFIG_DIR / f"{device_slug()}.json"
 
-    entries: Dict[Key, Dict[str, str]] = {}
+    entries: Dict[Key, dict] = {}
     if path.exists():
         data = json.loads(path.read_text())
         for entry in data.get("entries", []):
             shape = entry["shape"]
-            entries[Key(**shape)] = entry["plan"]
+            entries[Key(**shape)] = entry
         _TABLE_SOURCE = str(path)
     else:
         _TABLE_SOURCE = f"{path} (not found)"
@@ -230,20 +238,23 @@ def _build_plan(key: Key) -> Plan:
     if _TABLE is None:
         load_table()
 
-    spec = _TABLE.get(key) if _TABLE else None
-    if spec is None:
+    entry = _TABLE.get(key) if _TABLE else None
+    if entry is None:
         return _default_plan(key)
 
     default = _default_plan(key)
+    precision = _parse_precision(entry.get("precision"))
     chosen: Dict[str, Callable] = {}
-    for slot, name in spec.items():
+    for slot, name in (entry.get("plan") or {}).items():
         if slot not in SLOTS:
             continue
         fn = _REGISTRY[slot].get(name)
         if fn is None:
             # Table names a candidate that no longer exists (renamed, deleted,
             # or its module was not imported). Degrade rather than crash.
-            return replace(default, source=f"missing:{slot}/{name}")
+            return replace(
+                default, precision=precision, source=f"missing:{slot}/{name}"
+            )
         chosen[slot] = fn
 
     # A table entry may name only the slots it has an opinion about. The rest
@@ -255,7 +266,33 @@ def _build_plan(key: Key) -> Plan:
             if chosen.get(slot) is None:
                 chosen[slot] = getattr(default, slot)
 
-    return Plan(**chosen, source="table")
+    return Plan(**chosen, precision=precision, source="table")
+
+
+def _parse_precision(spec: Optional[dict]) -> Optional[PrecisionPlan]:
+    """Rebuild a precision plan from its JSON form.
+
+    Unknown preset names and unknown dtypes degrade to `None` rather than
+    raising: a stale table must never be able to stop the model from running.
+    """
+    if not spec:
+        return None
+
+    name = spec.get("compute_dtype")
+    if name in (None, "off", "float32"):
+        return PrecisionPlan(None, "off", reason="table")
+
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}.get(name)
+    preset = spec.get("preset", "all")
+    if dtype is None or preset not in NARROW_PRESETS:
+        return None
+
+    return PrecisionPlan(
+        dtype,
+        preset,
+        float(spec.get("measured_max_abs", 0.0)),
+        reason="table",
+    )
 
 
 def _default_plan(key: Key) -> Plan:
@@ -287,6 +324,7 @@ def explain(x: torch.Tensor, config) -> str:
         f"tokens  : {key.tokens:,}   head_dim: {key.head_dim}\n"
         f"table   : {_TABLE_SOURCE}\n"
         f"source  : {plan.source}\n"
+        f"precision: {plan.precision if plan.precision else 'calibrated at run time'}\n"
         f"attn    : {names['attn_block']}\n"
         f"ffn     : {names['ffn_block']}\n"
         f"full    : {names['full_block']}"
