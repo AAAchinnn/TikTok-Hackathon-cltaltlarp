@@ -145,7 +145,10 @@ The bottleneck moves with batch size, so one implementation cannot be right ever
 | low-overhead | `B <= 4` | ~40 kernel launches at 5-10 µs | CUDA graph replay |
 
 At `B <= 4` launch overhead is 200-400 µs of a ~2 ms pass. A CUDA graph collapses
-the whole forward to one host command.
+the whole forward to one host command. Capture is refused when an attention mask
+tensor survives to the kernel — a recording would bake it in and silently replay
+it for later inputs — so those cases run the same path eagerly. No official shape
+is affected: all are causal, and causal + verified suffix padding elides the mask.
 
 ### 3.7 Shape-aware dispatch
 

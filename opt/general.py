@@ -389,6 +389,15 @@ class OptimizedMixin:
         ffn_fn   = route.ffn_block  or blocks.ffn_general
         full_fn  = route.full_block
 
+        if ctx.attn_mask is not None:
+            # A graph capture would bake this mask tensor into the recording,
+            # and later inputs with different masks would silently replay the
+            # first one. The official shapes never reach here -- they are all
+            # causal, and causal + verified suffix padding elides the mask
+            # entirely -- but when a mask does survive, correctness beats the
+            # launch-overhead win: run the same routed path eagerly instead.
+            return self._run(x, invalid, weights, ctx, attn_fn, ffn_fn, full_fn)
+
         gkey = (tuple(x.shape), x.dtype, invalid is not None, str(plan))
         if gkey not in self._cuda_graphs:
             self._cuda_graphs[gkey] = _capture_graph(

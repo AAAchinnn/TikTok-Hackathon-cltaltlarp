@@ -184,11 +184,13 @@ candidates against precision presets, but today only the `general` candidate is
 registered per slot, so the routing table's real work is precision selection. The
 architecture is built for a second candidate; we have not yet earned one.
 
-**CUDA graph capture on the low-overhead route bakes in the attention mask.** For
-every official shape this is safe — they are all causal, and causal plus suffix
-padding means no mask tensor is built at all. A non-causal padded workload at
-`B <= 4` would silently reuse the first mask. The graph key should include mask
-identity.
+**CUDA graph replay is skipped when an attention mask tensor survives to the
+kernel.** A capture would bake the mask into the recording and silently replay it
+for later inputs, so those cases run the same routed path eagerly instead. No
+official shape is affected — they are all causal, and causal plus verified suffix
+padding elides the mask entirely — but a non-causal padded workload at `B <= 4`
+gives up the launch-overhead win rather than risk a stale mask. Including mask
+identity in the graph key would recover it.
 
 **Calibration measures one input.** `opt/precision.Calibrator` is the fallback when
 no routing table exists, and it judges a preset from a single warmup forward with a
