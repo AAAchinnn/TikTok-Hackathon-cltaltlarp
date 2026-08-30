@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from opt import OptimizedMixin
+
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -172,7 +174,7 @@ class BaselineTransformer(nn.Module):
         return x
 
 
-class UserOptimizedTransformer(BaselineTransformer):
+class UserOptimizedTransformer(OptimizedMixin, BaselineTransformer):
     """
     Replace this class with the optimized implementation.
 
@@ -615,8 +617,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-scale", type=float, default=1.0)
 
     parser.add_argument("--accuracy-trials", type=int, default=5)
-    parser.add_argument("--rtol", type=float, default=0.02)
-    parser.add_argument("--atol", type=float, default=0.002)
+    parser.add_argument("--rtol", type=float, default=0.01)
+    parser.add_argument("--atol", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=1234)
 
     parser.add_argument("--warmup", type=int, default=20)
